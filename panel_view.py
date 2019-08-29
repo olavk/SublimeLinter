@@ -1,3 +1,4 @@
+from collections import defaultdict
 from functools import partial
 from itertools import chain
 import os
@@ -14,14 +15,17 @@ MYPY = False
 if MYPY:
     from typing import (
         Any, Callable, Collection, Dict, Iterable, List, Optional, Set, Tuple,
-        Union
+        TypeVar, Union
     )
     from mypy_extensions import TypedDict
     from .lint.persist import LintError
 
+    T = TypeVar('T')
+    U = TypeVar('U')
     Filename = str
     State_ = TypedDict('State_', {
         'active_view': Optional[sublime.View],
+        'active_filename': Optional[str],
         'cursor': int,
         'panel_opened_automatically': Set[sublime.WindowId]
     })
@@ -39,6 +43,7 @@ OUTPUT_PANEL = "output." + PANEL_NAME
 
 State = {
     'active_view': None,
+    'active_filename': None,
     'cursor': -1,
     'panel_opened_automatically': set()
 }  # type: State_
@@ -46,8 +51,10 @@ State = {
 
 def plugin_loaded():
     active_window = sublime.active_window()
+    active_view = active_window.active_view()
     State.update({
-        'active_view': active_window.active_view()
+        'active_view': active_view,
+        'active_filename': util.get_filename(active_view) if active_view else None,
     })
     ensure_panel(active_window)
 
@@ -61,16 +68,53 @@ def plugin_unloaded():
         window.destroy_output_panel(PANEL_NAME)
 
 
+LINT_RESULT_CACHE = defaultdict(list)  # type: Dict[str, List[Tuple[Filename, str]]]
+REQUEST_LINT_RESULT = {}  # type: Dict[str, str]
+
+
+def unzip(zipped):
+    # type: (Iterable[Tuple[T, U]]) -> Tuple[Tuple[T, ...], Tuple[U, ...]]
+    return tuple(zip(*zipped))  # type: ignore
+
+
 @events.on(events.LINT_RESULT)
-def on_lint_result(filename, reason=None, **kwargs):
-    maybe_toggle_panel_automatically = reason in ('on_save', 'on_user_request')
+def on_lint_result(filename, linter_name, reason=None, **kwargs):
+    LINT_RESULT_CACHE[linter_name].append((filename, reason))
+
+    strategy = (
+        invalidate_token_and_run_immediately
+        if State['active_filename'] == filename
+        else throttle_using_worker_queue
+    )
+    strategy(
+        REQUEST_LINT_RESULT,
+        linter_name,
+        lambda: execute_on_lint_result_request(linter_name)
+    )
+
+
+def execute_on_lint_result_request(linter_name):
+    calls = LINT_RESULT_CACHE.pop(linter_name)
+    filenames, reasons = unzip(calls)
+    _on_lint_result_(
+        set(filenames),
+        not {'on_save', 'on_user_request'}.isdisjoint(reasons)
+    )
+
+
+def _on_lint_result_(filenames, maybe_toggle_panel_automatically):
+    # type: (Set[Filename], bool) -> None
     for window in sublime.windows():
-        if filename in filenames_per_window(window):
-            if panel_is_active(window):
+        panel_open = panel_is_active(window)
+        if (
+            (panel_open or maybe_toggle_panel_automatically)
+            and filenames & filenames_per_window(window)
+        ):
+            if panel_open:
                 fill_panel(window)
 
             if maybe_toggle_panel_automatically:
-                toggle_panel_if_errors(window, filename)
+                toggle_panel_if_errors(window, filenames)
 
 
 @events.on('updated_error_positions')
@@ -100,6 +144,7 @@ class UpdateState(sublime_plugin.EventListener):
 
         State.update({
             'active_view': active_view,
+            'active_filename': util.get_filename(active_view),
             'cursor': get_current_pos(active_view)
         })
         ensure_panel(window)
@@ -139,7 +184,7 @@ class UpdateState(sublime_plugin.EventListener):
         # In background mode most of the time the errors are already up-to-date
         # on save, so we (maybe) show the panel immediately.
         if view_gets_linted_on_modified_event(view):
-            toggle_panel_if_errors(view.window(), util.get_filename(view))
+            toggle_panel_if_errors(view.window(), {util.get_filename(view)})
 
     def on_post_window_command(self, window, command_name, args):
         if command_name == 'hide_panel':
@@ -171,7 +216,8 @@ def view_gets_linted_on_modified_event(view):
     return any(elect.runnable_linters_for_view(view, 'on_modified'))
 
 
-def toggle_panel_if_errors(window, filename):
+def toggle_panel_if_errors(window, filenames):
+    # type: (Optional[sublime.Window], Set[Filename]) -> None
     """Toggle the panel if the view or window has problems, depending on settings."""
     if window is None:
         return
@@ -182,8 +228,9 @@ def toggle_panel_if_errors(window, filename):
 
     errors_by_file = get_window_errors(window, persist.file_errors)
     has_relevant_errors = (
-        show_panel_on_save == 'window' and errors_by_file or
-        filename in errors_by_file)
+        show_panel_on_save == 'window' and errors_by_file
+        or filenames & errors_by_file.keys()
+    )
 
     if not panel_is_active(window) and has_relevant_errors:
         window.run_command("show_panel", {"panel": OUTPUT_PANEL})
@@ -254,7 +301,7 @@ def draw(draw_info):
     if content is None:
         draw_(**draw_info)
     else:
-        request_draw_on_main_thread(draw_info)
+        sublime.set_timeout(lambda: draw_(**draw_info))
 
 
 def draw_(panel, content=None, errors_from_active_view=[], nearby_lines=None):
@@ -276,25 +323,23 @@ def draw_(panel, content=None, errors_from_active_view=[], nearby_lines=None):
         scroll_into_view(panel, [nearby_lines], errors_from_active_view)
 
 
-REQUESTED_MAIN_DRAWS = {}  # type: Dict[sublime.ViewId, str]
+def throttle_using_worker_queue(token_cache, key, action):
+    # type: (Dict[T, str], T, Callable) -> None
+    token = token_cache[key] = uuid.uuid4().hex
+    proposition = lambda: token_cache[key] == token
+    sublime.set_timeout_async(lambda: maybe_run(proposition, action))
 
 
-def request_draw_on_main_thread(draw_info):
-    # type: (DrawInfo) -> None
-    global REQUESTED_MAIN_DRAWS
-
-    panel_id = draw_info['panel'].id()
-    token = REQUESTED_MAIN_DRAWS[panel_id] = uuid.uuid4().hex
-
-    proposition = lambda: REQUESTED_MAIN_DRAWS[panel_id] == token
-    action = lambda: draw_(**draw_info)
-    sublime.set_timeout_async(lambda: maybe_run_on_main_thread(proposition, action))
+def invalidate_token_and_run_immediately(token_cache, key, action):
+    # type: (Dict[T, str], T, Callable) -> None
+    token_cache[key] = uuid.uuid4().hex
+    action()
 
 
-def maybe_run_on_main_thread(prop, fn):
+def maybe_run(prop, action):
     # type: (Callable[[], bool], Callable) -> None
     if prop():
-        sublime.set_timeout(fn)
+        action()
 
 
 def get_window_errors(window, errors_by_file):
