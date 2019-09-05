@@ -347,6 +347,7 @@ def kill_active_popen_calls(bid):
         setattr(proc, 'friendly_terminated', True)
 
 
+@util.print_runtime('group_by_filename_and_update')
 def group_by_filename_and_update(
     window,            # type: sublime.Window
     main_filename,     # type: FileName
@@ -357,6 +358,15 @@ def group_by_filename_and_update(
 ):
     # type: (...) -> None
     """Group lint errors by filename and update them."""
+    print(
+        '\n{} errors across {} files from {}. {} errors in the store'
+        .format(
+            len(errors),
+            len(set(error['filename'] for error in errors)),
+            linter,
+            len(list(chain.from_iterable(persist.file_errors.values())))
+        )
+    )
     if view_has_changed():  # abort early
         return
 

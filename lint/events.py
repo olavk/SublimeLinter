@@ -1,6 +1,6 @@
 from collections import defaultdict
 import traceback
-
+from . import util
 
 LINT_START = 'LINT_START'    # (buffer_id)
 LINT_RESULT = 'LINT_RESULT'  # (filename, linter_name, errors)
@@ -25,6 +25,8 @@ def broadcast(topic, message=None):
     payload = message.copy() or {}
     for fn in listeners.get(topic, []):
         try:
+            # with util.print_runtime('broadcast {}.{}'.format(fn.__module__, fn.__name__)):
+            #     fn(**payload)
             fn(**payload)
         except Exception:
             traceback.print_exc()
