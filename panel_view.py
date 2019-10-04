@@ -1,5 +1,5 @@
 from collections import defaultdict
-from functools import partial
+from functools import lru_cache, partial
 from itertools import chain
 import os
 import sublime
@@ -379,6 +379,7 @@ def filenames_per_window(window):
     )
 
 
+@lru_cache(maxsize=16)
 def create_path_dict(filenames):
     # type: (Collection[Filename]) -> Tuple[Dict[Filename, str], str]
     base_dir = get_common_parent([
@@ -409,8 +410,11 @@ def format_header(f_path):
     return "{}:".format(f_path)
 
 
-def format_error(error, widths):
-    # type: (LintError, Dict[str, int]) -> List[str]
+@lru_cache(maxsize=512)
+def format_error(error_as_tuple, widths_as_tuple):
+    # type: (Tuple[Tuple[str, object], ...], Tuple[Tuple[str, int], ...]) -> List[str]
+    error = dict(error_as_tuple)  # type: LintError  # type: ignore
+    widths = dict(widths_as_tuple)  # type: Dict[str, int]
     code_width = widths['code']
     code_tmpl = ":{{code:<{}}}".format(code_width)
     tmpl = (
@@ -447,7 +451,7 @@ def fill_panel(window):
         return
 
     errors_by_file = get_window_errors(window, persist.file_errors)
-    fpath_by_file, base_dir = create_path_dict(errors_by_file.keys())
+    fpath_by_file, base_dir = create_path_dict(tuple(errors_by_file.keys()))
 
     settings = panel.settings()
     settings.set("result_base_dir", base_dir)
@@ -471,6 +475,7 @@ def fill_panel(window):
         )
     )  # type: Dict[str, int]
     widths['viewport'] = int(panel.viewport_extent()[0] // panel.em_width() - 1)
+    widths_as_tuple = tuple(widths.items())
 
     to_render = []
     for fpath, errors in sorted(
@@ -479,7 +484,12 @@ def fill_panel(window):
         to_render.append(format_header(fpath))
 
         for error in errors:
-            lines = format_error(error, widths)
+            error_as_tuple = tuple(
+                (k, v)
+                for k, v in error.items()
+                if k != 'region'  # region is not hashable
+            )
+            lines = format_error(error_as_tuple, widths_as_tuple)
             to_render.extend(lines)
             error["panel_line"] = (len(to_render) - len(lines), len(to_render) - 1)
 
