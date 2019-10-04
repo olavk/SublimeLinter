@@ -21,8 +21,7 @@ def unsubscribe(topic, fn):
         pass
 
 
-def broadcast(topic, message=None):
-    payload = message.copy() or {}
+def broadcast(topic, payload={}):
     for fn in listeners.get(topic, []):
         try:
             # with util.print_runtime('broadcast {}.{}'.format(fn.__module__, fn.__name__)):
