@@ -68,6 +68,7 @@ def plugin_unloaded():
         window.destroy_output_panel(PANEL_NAME)
 
 
+LAST_RESULTS = defaultdict(tuple)
 LINT_RESULT_CACHE = defaultdict(list)  # type: Dict[str, List[Tuple[Filename, str]]]
 REQUEST_LINT_RESULT = {}  # type: Dict[str, str]
 
@@ -78,7 +79,13 @@ def unzip(zipped):
 
 
 @events.on(events.LINT_RESULT)
-def on_lint_result(filename, linter_name, reason=None, **kwargs):
+def on_lint_result(filename, linter_name, errors, reason=None, **kwargs):
+    key = (filename, linter_name)
+    token = tuple(e['uid'] for e in errors) + (persist.settings.change_count(),)
+    if LAST_RESULTS[key] == token:
+        return
+
+    LAST_RESULTS[key] = token
     LINT_RESULT_CACHE[linter_name].append((filename, reason))
 
     strategy = (

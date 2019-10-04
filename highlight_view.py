@@ -74,8 +74,21 @@ def plugin_unloaded():
             undraw(view)
 
 
+LAST_RESULTS = defaultdict(tuple)
+
+
 @events.on(events.LINT_RESULT)
-def on_lint_result(filename, linter_name, **kwargs):
+def on_lint_result(filename, linter_name, errors, **kwargs):
+    key = (filename, linter_name)
+    token = tuple(e['uid'] for e in errors) + (persist.settings.change_count(),)
+    if LAST_RESULTS[key] == token:
+        return
+
+    LAST_RESULTS[key] = token
+    _on_lint_result(filename, linter_name)
+
+
+def _on_lint_result(filename, linter_name):
     views = list(all_views_into_file(filename))
     if not views:
         return
